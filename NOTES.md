@@ -3,10 +3,15 @@
 Two scripts write a binary-threshold **label** image into the existing
 OME-Zarr **v0.5** store `6001240_labels.zarr`:
 
-| Script | Writing approach |
-|---|---|
-| `threshold_label.py` | Pyramid, metadata and chunking written **by hand** with `zarr` v3. |
-| `threshold_label_omezarr.py` | Same Otsu + pyramid, but writing delegated to **`ome-zarr-py`** (`write_multiscale_labels`). |
+| Script | Approach | Memory model |
+|---|---|---|
+| `threshold_label.py` | Pyramid, metadata and chunking written **by hand** with `zarr` v3. | Eager — full channel in RAM. |
+| `threshold_label_omezarr.py` | Same Otsu + pyramid, but writing delegated to **`ome-zarr-py`** (`write_multiscale_labels`). | Eager — full channel in RAM. |
+| `threshold_label_dask.py` | Read via ome-zarr-py Reader, lazy **dask** end-to-end: streamed histogram Otsu + streamed `da.to_zarr` writes. | Out-of-core — a few chunks in RAM. |
+
+All three produce **byte-identical** label output (same v0.5 metadata, scales,
+`int8` data, chunks `(1,1,256,256)`, shards `(1,10,512,512)`). They differ only
+in *how* they read/write, not in *what* they write.
 
 Both read the source image (path `0`, shape `[2, 236, 275, 271]`, `uint16`,
 axes `c,z,y,x`), threshold one channel (default `1` = Dapi), and write the
@@ -80,6 +85,65 @@ dimension_names, and the `image-label` block.
   with the source, uses no deprecated arguments, minimal deps.
 - `ome-zarr-py` (`threshold_label_omezarr.py`): fewer lines, spec-tracking
   metadata from the reference implementation; accept `sN` level naming.
+
+## Scaling to very large datasets
+
+The two eager scripts read the **entire channel into RAM** in one line
+(`chan = image[args.channel]`), then build the mask and pyramid in memory. Fine
+for this dataset (channel ≈ 236×275×271×2 B ≈ **35 MB**), but it **OOMs** on
+light-sheet / whole-slide volumes.
+
+**Is dask used?** Only incidentally in the eager path: `ome-zarr-py` calls
+`da.from_array(level)` + `da.to_zarr` internally, so *writes* stream — but the
+arrays handed to it are already fully materialised numpy, so peak residency is
+still the whole channel.
+
+`threshold_label_dask.py` fixes this by staying lazy end-to-end:
+
+1. **Read lazily** — the ome-zarr-py Reader yields `node.data`, one dask array
+   per level; nothing is materialised.
+2. **Streamed Otsu** — one pass for min/max, one for `da.histogram`; only the
+   256-bin histogram lands in RAM. Identical maths to the numpy Otsu (factored
+   into `otsu_from_histogram`), so the threshold is bit-for-bit the same.
+3. **Lazy mask + pyramid** — `(chan > thr)` and `[..., ::2, ::2]` stay dask
+   graphs; each level is `rechunk`-ed to the shard shape so writes align.
+4. **Streamed write** — dask arrays go straight to `da.to_zarr`; peak memory is
+   a few chunks, not the whole volume.
+
+Cost: a global histogram is still one full read pass (unavoidable for Otsu),
+and Otsu needs a value range (uses the channel's min/max — one extra pass).
+
+### Reading: ome-zarr-py Reader vs. `zarr.open_group`
+
+`Reader(parse_url(path))` → `node.data` is a list of **lazy dask arrays** (one
+per level) plus parsed `node.metadata["axes"]` and
+`["coordinateTransformations"]`. Worth using in the dask script — it hands you
+exactly the lazy arrays + parsed metadata the pipeline consumes.
+
+But it does **not** replace `zarr`:
+- It chunks the dask array at **inner-chunk** granularity `(1,1,256,256)`, not
+  the shard shape `(1,10,512,512)`. Mirroring the source chunk grid on write
+  still needs `zarr.open_array(...).shards`.
+- The reader is **read-only**; `write_multiscale_labels` needs a writable
+  `zarr.Group` (`zarr.open_group(mode="a")`).
+
+So `threshold_label_dask.py` uses the Reader for the read side and keeps `zarr`
+for the write side + the shard lookup. For the eager scripts the Reader is not
+worth it — they materialise anyway and still need `zarr` to write.
+
+### Benchmark caveat: dask is *slower* on small data
+
+Measured on this 35 MB channel (peak RSS via `/usr/bin/time -v`):
+
+| Script | Wall clock | Peak RSS |
+|---|---|---|
+| `threshold_label.py` (eager numpy) | ~0.9 s | ~177 MB |
+| `threshold_label_dask.py` (dask)   | ~2.0 s | ~318 MB |
+
+Dask's scheduler/graph overhead **loses** when the data fits comfortably in
+RAM. Its win is strictly at scale — past the point where the eager version
+would exhaust memory. **Rule of thumb: use the eager script until the channel
+no longer fits in RAM, then switch to the dask script.**
 
 ### The Otsu threshold is intentionally hand-rolled
 `otsu_threshold()` is a small numpy implementation, kept in **both** scripts to

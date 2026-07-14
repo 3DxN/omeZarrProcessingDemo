@@ -4,11 +4,16 @@
 Unlike threshold_label.py / threshold_label_omezarr.py -- which read the whole
 channel into RAM -- this variant keeps the data lazy end-to-end:
 
-  * the source channel is read as a dask array (nothing materialised),
+  * the source is read with ome-zarr-py's Reader, which yields one lazy dask
+    array per pyramid level plus parsed axes / coordinateTransformations,
   * Otsu is computed from a streamed dask histogram (only 256 bins land in RAM),
   * the mask + pyramid stay lazy dask graphs, and
   * ome-zarr-py's `write_multiscale_labels` streams each chunk to disk via
     `da.to_zarr`, so peak memory is a few chunks, not the whole volume.
+
+The Reader handles read-side metadata, but `zarr` is still used to WRITE (the
+reader is read-only) and to read each source level's shard shape -- the reader
+only exposes inner-chunk granularity, not the shard grid.
 
 The Otsu maths is identical to the numpy version in threshold_label.py; here it
 is fed a precomputed histogram instead of a numpy array.
@@ -21,6 +26,8 @@ import warnings
 import dask.array as da
 import numpy as np
 import zarr
+from ome_zarr.io import parse_url
+from ome_zarr.reader import Reader
 from ome_zarr.writer import write_multiscale_labels
 
 
@@ -73,25 +80,28 @@ def main() -> None:
                     help="number of pyramid levels (default: match the source image)")
     args = ap.parse_args()
 
-    # --- open the source OME-Zarr v0.5 image (lazily) --------------------
-    root = zarr.open_group(args.zarr_path, mode="a")
-    image_meta = root.attrs["ome"]["multiscales"][0]
-    axes = image_meta["axes"]
+    # --- read the source image via ome-zarr-py (lazy dask + parsed meta) --
+    parsed = parse_url(args.zarr_path)
+    if parsed is None:
+        raise SystemExit(f"Not an OME-Zarr store: {args.zarr_path}")
+    node = list(Reader(parsed)())[0]                # first node = the image
+    axes = node.metadata["axes"]                    # parsed axis dicts
     axis_names = [a["name"] for a in axes]
     y_ax, x_ax = axis_names.index("y"), axis_names.index("x")
 
-    src_dataset = next(d for d in image_meta["datasets"] if d["path"] == args.scale_path)
-    base_scale = next(t for t in src_dataset["coordinateTransformations"]
-                      if t["type"] == "scale")["scale"]
-    src_paths = [d["path"] for d in image_meta["datasets"]]
-    n_levels = args.levels if args.levels is not None else len(src_paths)
+    # zarr is still needed to WRITE and to read each level's shard shape
+    # (the reader only exposes inner-chunk granularity, not the shard grid).
+    root = zarr.open_group(args.zarr_path, mode="a")
+    src_paths = [d["path"] for d in root.attrs["ome"]["multiscales"][0]["datasets"]]
 
-    src_arr = root[args.scale_path]
-    # chunk the dask view at shard granularity so reads/writes align to shards
-    image = da.from_array(src_arr, chunks=src_arr.shards)
-    chan = image[args.channel]                      # lazy (z, y, x)
+    scale_index = src_paths.index(args.scale_path)
+    base_scale = node.metadata["coordinateTransformations"][scale_index][0]["scale"]
+    n_levels = args.levels if args.levels is not None else len(node.data)
+
+    # node.data is one lazy dask array per level (largest first); index a channel
+    chan = node.data[scale_index][args.channel]     # lazy (z, y, x)
     print(f"Channel {args.channel}: shape={chan.shape} dtype={chan.dtype} "
-          f"chunks={chan.chunksize} (lazy dask array, not in RAM)")
+          f"chunks={chan.chunksize} (lazy dask array via ome-zarr-py Reader)")
 
     # --- compute the binary threshold (streamed) -------------------------
     if args.threshold is None:
