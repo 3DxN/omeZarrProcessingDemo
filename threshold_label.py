@@ -101,15 +101,27 @@ def main() -> None:
     base_scale = next(t for t in transforms if t["type"] == "scale")["scale"]
     dim_names = axis_names
 
+    # Mirror the source image's chunk grid so the label chunking corresponds to
+    # the source. The source shards a (1,10,512,512) shard into (1,1,256,256)
+    # inner chunks; reuse the matching source level's chunks/shards per level
+    # (falling back to the deepest source level for any extra label levels).
+    src_paths = [d["path"] for d in image_meta["datasets"]]
+
+    def source_chunking(i: int):
+        src = root[src_paths[min(i, len(src_paths) - 1)]]
+        return src.chunks, src.shards
+
     # Build the pyramid: level 0 is the full-resolution mask; each subsequent
     # level halves y/x (nearest-neighbour) and doubles the y/x scale factor.
     datasets = []
     level = mask
     for i in range(n_levels):
+        chunks, shards = source_chunking(i)
         arr = label_group.create_array(
             name=str(i),
             shape=level.shape,
-            chunks=tuple(min(c, s) for c, s in zip((1, 10, 512, 512), level.shape)),
+            chunks=chunks,
+            shards=shards,
             dtype="int8",
             dimension_names=dim_names,
             fill_value=0,
@@ -123,7 +135,7 @@ def main() -> None:
             "path": str(i),
             "coordinateTransformations": [{"type": "scale", "scale": scale}],
         })
-        print(f"  level {i}: shape={level.shape} scale={scale}")
+        print(f"  level {i}: shape={level.shape} chunks={chunks} shards={shards}")
 
         if i + 1 < n_levels:
             level = downsample_yx(level, y_ax, x_ax)
