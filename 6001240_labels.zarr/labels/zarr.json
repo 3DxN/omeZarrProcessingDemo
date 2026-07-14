@@ -1,0 +1,13 @@
+{
+  "attributes": {
+    "ome": {
+      "version": "0.5",
+      "labels": [
+        "0",
+        "threshold"
+      ]
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}
