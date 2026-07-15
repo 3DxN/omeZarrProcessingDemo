@@ -25,14 +25,20 @@ is fed a precomputed histogram instead of a numpy array.
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 import warnings
+from pathlib import Path
 
 import dask.array as da
 import numpy as np
 from ome_zarr import OMEZarrMultiscale
 from ome_zarr.writer import write_multiscale_labels
+
+
+def rmtree(path: Path) -> None:
+    """Recursively delete a directory tree (pathlib-only, no shutil)."""
+    for child in path.iterdir():
+        rmtree(child) if child.is_dir() else child.unlink()
+    path.rmdir()
 
 
 def otsu_from_histogram(counts: np.ndarray, centers: np.ndarray) -> float:
@@ -157,9 +163,9 @@ def main() -> None:
     # write_multiscale_labels uses require_group (no overwrite), so remove any
     # prior label dir first to avoid leftover levels. Local-store assumption:
     # the write side targets a filesystem path.
-    stale = os.path.join(args.zarr_path, "labels", args.label_name)
-    if os.path.isdir(stale):
-        shutil.rmtree(stale)
+    stale = Path(args.zarr_path) / "labels" / args.label_name
+    if stale.is_dir():
+        rmtree(stale)
 
     with warnings.catch_warnings():
         # coordinate_transformations is deprecated but is the only way to pin
