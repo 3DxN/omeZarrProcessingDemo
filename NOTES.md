@@ -132,14 +132,43 @@ path and is cleaner than hand-parsing `root.attrs["ome"]`.
 
 But it does **not** replace `zarr`:
 - It exposes only **inner-chunk** granularity `(1,1,256,256)`, not the shard
-  shape `(1,10,512,512)`. Mirroring the source chunk grid on write still needs
-  `zarr.open_array(...).shards`.
-- It is **read-oriented**; `write_multiscale_labels` needs a writable
-  `zarr.Group` (`zarr.open_group(mode="a")`).
+  shape `(1,10,512,512)`. `from_ome_zarr` builds `da.from_zarr(group[path])`
+  (dask sees only inner chunks), `OMEZarrImage`'s fields are just
+  `data/axes/scale/axes_units/name`, and `OMEZarrMultiscale` keeps no store
+  handle — so the shard shape is unreachable through the high-level API.
+- It is **read-oriented** — though note `write_multiscale_labels` *does* accept
+  a path string and writes sharded + registers, so `zarr` is not strictly
+  required to write (see below).
 
-So the dask script reads via `OMEZarrMultiscale` and keeps `zarr` for the write
-side + the shard lookup. For the eager scripts the high-level reader is not
-worth it — they materialise anyway and still need `zarr` to write.
+So the dask script reads via `OMEZarrMultiscale` and keeps `zarr` for the shard
+lookup, reusing that handle to write. For the eager scripts the high-level
+reader is not worth it — they materialise anyway and still need `zarr`.
+
+### Does ome-zarr-py support sharding? Is the shard shape required?
+
+`ome-zarr-py` 0.18 (the latest release) **fully supports sharded writes** via
+`storage_options=[{"chunks": ..., "shards": ...}]` per level, and
+`write_multiscale_labels(pyramid, "<path>", ...)` accepts a plain path string —
+it opens the store, writes the sharded arrays, and registers the label. So the
+write does not intrinsically need a `zarr.Group`.
+
+**Why the shard shape is read at all:** only to satisfy our self-imposed goal of
+*mirroring the source chunk grid* (see "Label chunking mirrors the source"
+above). That is a **consistency + co-access-performance** choice, not an
+OME-Zarr correctness requirement — chunk/shard layout is a per-array storage
+detail, independent of the multiscales / image-label metadata.
+
+**Can the process work without it? Yes** (verified): calling
+`write_multiscale_labels` with **no** `shards` in `storage_options` produces a
+valid v0.5 label — it just comes out **unsharded** (`shards=None`, default
+chunking, `Bytes`+`Zstd` codecs instead of a sharding codec) and still
+registers. You could equally pick any chunk/shard shape of your own without
+reading the source's.
+
+The only reason `zarr` remains is that mirroring the source shard grid requires
+`zarr.open_array(...).shards`, which the high-level API does not surface. Drop
+the mirroring requirement and `zarr` could be dropped from the dask script
+entirely (path-string write + no shard lookup).
 
 ### Why NOT the high-level `OMEZarrLabels` writer
 

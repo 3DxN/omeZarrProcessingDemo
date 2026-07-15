@@ -88,8 +88,18 @@ def main() -> None:
     axis_names = [a["name"] for a in axes]
     y_ax, x_ax = axis_names.index("y"), axis_names.index("x")
 
-    # zarr is still needed to WRITE and to read each level's shard shape
-    # (the high-level API exposes inner-chunk granularity, not the shard grid).
+    # ome-zarr-py CAN write sharded output (via storage_options below) and
+    # write_multiscale_labels even accepts a path string, so zarr is not
+    # strictly required to write. We open a zarr handle here for ONE thing the
+    # high-level API can't do: read each source level's shard shape. `da.from_zarr`
+    # and OMEZarrImage expose only inner-chunk granularity (1,1,256,256), never
+    # the shard grid (1,10,512,512), and the object keeps no store handle.
+    #
+    # This is only needed because we choose to MIRROR the source chunk grid --
+    # a consistency/co-access-performance goal, NOT an OME-Zarr requirement.
+    # Omit `shards` from storage_options and the label is still a valid v0.5
+    # label, just unsharded (ome-zarr-py falls back to default chunking). Since
+    # we need a zarr handle for the shard lookup anyway, we reuse it to write.
     root = zarr.open_group(args.zarr_path, mode="a")
     src_paths = [d["path"] for d in root.attrs["ome"]["multiscales"][0]["datasets"]]
 
