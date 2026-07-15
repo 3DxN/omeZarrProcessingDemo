@@ -11,10 +11,13 @@ channel into RAM -- this variant keeps the data lazy end-to-end:
   * ome-zarr-py's `write_multiscale_labels` streams each chunk to disk via
     `da.to_zarr`, so peak memory is a few chunks, not the whole volume.
 
-`OMEZarrMultiscale` handles read-side metadata, but `zarr` is still used to
-WRITE (`write_multiscale_labels` needs a writable group) and to read each source
-level's shard shape -- the high-level API only exposes inner-chunk granularity,
-not the shard grid.
+`OMEZarrMultiscale` handles read-side metadata -- including each level's inner
+chunk shape, exposed as `.images[i].data.chunksize` -- and the write goes through
+`write_multiscale_labels` with a path string, so this script has **no direct
+`zarr` dependency**. The inner CHUNK shape is mirrored from the source image; the
+SHARD shape is that chunk times a user-defined factor per axis (`--shard-*`,
+default c=1 z=4 y=4 x=4 t=1), or disabled with `--no-shard`. (Only the source's
+*shard* shape is unreachable through the high-level API; its chunk shape is not.)
 
 The Otsu maths is identical to the numpy version in threshold_label.py; here it
 is fed a precomputed histogram instead of a numpy array.
@@ -22,11 +25,12 @@ is fed a precomputed histogram instead of a numpy array.
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import warnings
 
 import dask.array as da
 import numpy as np
-import zarr
 from ome_zarr import OMEZarrMultiscale
 from ome_zarr.writer import write_multiscale_labels
 
@@ -78,7 +82,18 @@ def main() -> None:
                     help="multiscale level of the source image to read")
     ap.add_argument("--levels", type=int, default=None,
                     help="number of pyramid levels (default: match the source image)")
+    # Sharding factors: shard shape = source chunk shape x factor, per axis.
+    ap.add_argument("--shard-c", type=int, default=1, help="chunks per shard along c")
+    ap.add_argument("--shard-z", type=int, default=4, help="chunks per shard along z")
+    ap.add_argument("--shard-y", type=int, default=4, help="chunks per shard along y")
+    ap.add_argument("--shard-x", type=int, default=4, help="chunks per shard along x")
+    ap.add_argument("--shard-t", type=int, default=1, help="chunks per shard along t")
+    ap.add_argument("--no-shard", action="store_true",
+                    help="write unsharded (chunks only, no shard grid)")
     args = ap.parse_args()
+
+    shard_factor = {"c": args.shard_c, "z": args.shard_z, "y": args.shard_y,
+                    "x": args.shard_x, "t": args.shard_t}
 
     # --- read the source image via ome-zarr-py's high-level API ----------
     # OMEZarrMultiscale.from_ome_zarr gives one lazy dask array per pyramid
@@ -88,21 +103,7 @@ def main() -> None:
     axis_names = [a["name"] for a in axes]
     y_ax, x_ax = axis_names.index("y"), axis_names.index("x")
 
-    # ome-zarr-py CAN write sharded output (via storage_options below) and
-    # write_multiscale_labels even accepts a path string, so zarr is not
-    # strictly required to write. We open a zarr handle here for ONE thing the
-    # high-level API can't do: read each source level's shard shape. `da.from_zarr`
-    # and OMEZarrImage expose only inner-chunk granularity (1,1,256,256), never
-    # the shard grid (1,10,512,512), and the object keeps no store handle.
-    #
-    # This is only needed because we choose to MIRROR the source chunk grid --
-    # a consistency/co-access-performance goal, NOT an OME-Zarr requirement.
-    # Omit `shards` from storage_options and the label is still a valid v0.5
-    # label, just unsharded (ome-zarr-py falls back to default chunking). Since
-    # we need a zarr handle for the shard lookup anyway, we reuse it to write.
-    root = zarr.open_group(args.zarr_path, mode="a")
-    src_paths = [d["path"] for d in root.attrs["ome"]["multiscales"][0]["datasets"]]
-
+    src_paths = [d.path for d in ms.metadata.datasets]
     scale_index = src_paths.index(args.scale_path)
     img = ms.images[scale_index]
     base_scale = [img.scale[name] for name in axis_names]   # source's exact scales
@@ -124,25 +125,41 @@ def main() -> None:
     mask = (chan > thr).astype(np.int8)[np.newaxis, ...]
 
     # --- build the lazy nearest-neighbour pyramid ------------------------
+    n_src = len(ms.images)
     pyramid, transforms, storage_options = [], [], []
     level = mask
     for i in range(n_levels):
-        src = root[src_paths[min(i, len(src_paths) - 1)]]
-        # align each level's dask blocks to its shard shape for streamed writes
-        shard = tuple(min(s, d) for s, d in zip(src.shards, level.shape))
-        pyramid.append(level.rechunk(shard))
+        # CHUNK: mirror the source level's inner chunk shape (high-level API).
+        # `data.chunksize` is dask's effective chunk: at sub-levels where the
+        # source's declared chunk (256) exceeds the axis, it reports the clamped
+        # dim (e.g. 137) -- functionally the same single chunk, no zarr needed.
+        chunk = tuple(ms.images[min(i, n_src - 1)].data.chunksize)
+        opts = {"chunks": chunk}
+        write_chunks = chunk
+        if not args.no_shard:
+            # SHARD: chunk x the user-defined per-axis factor.
+            shard = tuple(c * shard_factor.get(name, 1)
+                          for c, name in zip(chunk, axis_names))
+            opts["shards"] = shard
+            write_chunks = shard          # one dask block per shard for streamed writes
+        pyramid.append(level.rechunk(write_chunks))
+        storage_options.append(opts)
+
         scale = list(base_scale)
         scale[y_ax] *= 2 ** i
         scale[x_ax] *= 2 ** i
         transforms.append([{"type": "scale", "scale": scale}])
-        storage_options.append({"chunks": src.chunks, "shards": src.shards})
-        print(f"  level {i}: shape={level.shape} chunks={src.chunks} shards={src.shards}")
+        print(f"  level {i}: shape={level.shape} chunks={chunk} shards={opts.get('shards')}")
         if i + 1 < n_levels:
             level = downsample_yx(level, y_ax, x_ax)
 
     # --- delete any stale label group, then stream to disk ---------------
-    if "labels" in root and args.label_name in root["labels"]:
-        del root["labels"][args.label_name]
+    # write_multiscale_labels uses require_group (no overwrite), so remove any
+    # prior label dir first to avoid leftover levels. Local-store assumption:
+    # the write side targets a filesystem path.
+    stale = os.path.join(args.zarr_path, "labels", args.label_name)
+    if os.path.isdir(stale):
+        shutil.rmtree(stale)
 
     with warnings.catch_warnings():
         # coordinate_transformations is deprecated but is the only way to pin
@@ -150,7 +167,7 @@ def main() -> None:
         warnings.simplefilter("ignore", DeprecationWarning)
         write_multiscale_labels(
             pyramid,                     # dask arrays -> da.to_zarr streams them
-            root,
+            args.zarr_path,              # path string -> no zarr.Group needed
             name=args.label_name,
             axes=axes,
             coordinate_transformations=transforms,
@@ -162,9 +179,9 @@ def main() -> None:
             compute=True,
         )
 
-    labels = list(root["labels"].attrs["ome"]["labels"])
+    written = OMEZarrMultiscale.from_ome_zarr(args.zarr_path)
     print(f"Wrote label group: labels/{args.label_name}")
-    print(f"labels/ now contains: {labels}")
+    print(f"labels/ now contains: {sorted(written.labels)}")
 
 
 if __name__ == "__main__":

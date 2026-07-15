@@ -42,9 +42,12 @@ Derived at runtime from `len(multiscales[0].datasets)` of the source image
 
 ### 3. Label chunking mirrors the source chunk grid
 The source arrays are **sharded**: shard shape `(1, 10, 512, 512)` subdivided
-into inner chunks `(1, 1, 256, 256)`. Each label level reads the matching
-source level's `.chunks` and `.shards` and reuses them, so the label chunk
-grid corresponds to the source's.
+into inner chunks `(1, 1, 256, 256)`. In `threshold_label.py` and
+`threshold_label_omezarr.py`, each label level reads the matching source level's
+`.chunks` and `.shards` (via `zarr`) and reuses both, so the label chunk grid
+corresponds to the source's. `threshold_label_dask.py` diverges deliberately: it
+mirrors only the **chunk** shape (from the high-level API, no `zarr`) and lets
+the user pick the **shard** scheme via CLI — see "Chunking vs. sharding" below.
 
 ### 4. Label array keeps the channel axis (size 1)
 The store's arrays are `(c, z, y, x)`; the existing `labels/0` array is
@@ -128,21 +131,30 @@ ms.labels              # {'0': ..., 'threshold': ...} existing labels
 ```
 
 It replaces the older low-level `parse_url` + `Reader` + `node.metadata[...]`
-path and is cleaner than hand-parsing `root.attrs["ome"]`.
+path and is cleaner than hand-parsing `root.attrs["ome"]`. As a result
+**`threshold_label_dask.py` has no `import zarr` at all** — it reads via
+`OMEZarrMultiscale` and writes via `write_multiscale_labels(pyramid, "<path>",
+...)` (a path string, not a `zarr.Group`).
 
-But it does **not** replace `zarr`:
-- It exposes only **inner-chunk** granularity `(1,1,256,256)`, not the shard
-  shape `(1,10,512,512)`. `from_ome_zarr` builds `da.from_zarr(group[path])`
-  (dask sees only inner chunks), `OMEZarrImage`'s fields are just
-  `data/axes/scale/axes_units/name`, and `OMEZarrMultiscale` keeps no store
-  handle — so the shard shape is unreachable through the high-level API.
-- It is **read-oriented** — though note `write_multiscale_labels` *does* accept
-  a path string and writes sharded + registers, so `zarr` is not strictly
-  required to write (see below).
+The one asymmetry to know: the high-level API exposes each level's **inner
+chunk** shape (`ms.images[i].data.chunksize`) but **not** its shard shape.
+`from_ome_zarr` builds `da.from_zarr(group[path])` — dask sees inner chunks
+only; `OMEZarrImage`'s fields are just `data/axes/scale/axes_units/name`; and
+`OMEZarrMultiscale` keeps no store handle. So the source *chunk* grid can be
+mirrored without `zarr`, but the source *shard* grid cannot be read at all.
 
-So the dask script reads via `OMEZarrMultiscale` and keeps `zarr` for the shard
-lookup, reusing that handle to write. For the eager scripts the high-level
-reader is not worth it — they materialise anyway and still need `zarr`.
+### Chunking vs. sharding in `threshold_label_dask.py`
+
+- **Chunking is mirrored from the source** via `ms.images[i].data.chunksize`.
+  Caveat: `data.chunksize` is dask's *effective* chunk — at sub-levels where the
+  source's declared chunk (`256`) exceeds the axis, dask reports the clamped dim
+  (`137`, `68`). Functionally the same single chunk; just not literally `256`.
+  Reading the declared `256` would require `zarr` (which we dropped).
+- **Sharding is user-defined** via argparse: `--shard-c/-z/-y/-x/-t` give the
+  per-axis factor (chunks per shard), default `c=1 z=4 y=4 x=4 t=1`, so
+  `shard = chunk × factor` (e.g. x: `256 × 4 = 1024`). `--no-shard` writes
+  unsharded. Verified: defaults, custom factors, and `--no-shard` all produce
+  valid v0.5 labels; the pixel data is identical regardless of scheme.
 
 ### Does ome-zarr-py support sharding? Is the shard shape required?
 
@@ -152,23 +164,17 @@ reader is not worth it — they materialise anyway and still need `zarr`.
 it opens the store, writes the sharded arrays, and registers the label. So the
 write does not intrinsically need a `zarr.Group`.
 
-**Why the shard shape is read at all:** only to satisfy our self-imposed goal of
-*mirroring the source chunk grid* (see "Label chunking mirrors the source"
-above). That is a **consistency + co-access-performance** choice, not an
-OME-Zarr correctness requirement — chunk/shard layout is a per-array storage
-detail, independent of the multiscales / image-label metadata.
+**Is matching the source shard grid required? No.** Chunk/shard layout is a
+per-array storage detail, independent of the multiscales / image-label metadata.
+Mirroring it would be a consistency / co-access-performance choice, but it is not
+an OME-Zarr correctness requirement — so the dask script instead lets the user
+pick the shard scheme (defaulting to a sensible factor) and only mirrors the
+chunk shape.
 
-**Can the process work without it? Yes** (verified): calling
-`write_multiscale_labels` with **no** `shards` in `storage_options` produces a
-valid v0.5 label — it just comes out **unsharded** (`shards=None`, default
-chunking, `Bytes`+`Zstd` codecs instead of a sharding codec) and still
-registers. You could equally pick any chunk/shard shape of your own without
-reading the source's.
-
-The only reason `zarr` remains is that mirroring the source shard grid requires
-`zarr.open_array(...).shards`, which the high-level API does not surface. Drop
-the mirroring requirement and `zarr` could be dropped from the dask script
-entirely (path-string write + no shard lookup).
+**Can it work with no sharding at all? Yes** (verified): `--no-shard` (i.e.
+`write_multiscale_labels` with no `shards` in `storage_options`) produces a valid
+v0.5 label — just **unsharded** (`shards=None`, `Bytes`+`Zstd` codecs instead of
+a sharding codec) and still registered.
 
 ### Why NOT the high-level `OMEZarrLabels` writer
 
@@ -224,5 +230,14 @@ python threshold_label.py --label-name mymask   # custom label name
 python threshold_label.py --levels 4            # override pyramid depth
 ```
 
-`threshold_label_omezarr.py` takes the same flags. Both delete an existing
-`labels/<name>` before writing, so re-runs are idempotent.
+`threshold_label_omezarr.py` takes the same flags. All scripts delete an
+existing `labels/<name>` before writing, so re-runs are idempotent.
+
+`threshold_label_dask.py` adds sharding controls (chunk shape is mirrored from
+the source; only the shard factor is user-chosen):
+
+```
+python threshold_label_dask.py                        # shards = chunk x (c1 z4 y4 x4)
+python threshold_label_dask.py --shard-z 2 --shard-y 8 # custom per-axis factors
+python threshold_label_dask.py --no-shard             # unsharded (chunks only)
+```
