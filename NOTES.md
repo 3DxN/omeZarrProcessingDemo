@@ -200,6 +200,39 @@ path is kept instead:
 (Its NEAREST pyramid does round shapes like the source — `275→137→68` — vs the
 scripts' `::2` `275→138→69`; both are valid nearest conventions.)
 
+### `write_multiscale_labels` vs `write_labels`: who builds the pyramid?
+
+Two writer functions, easy to confuse:
+
+- **`write_multiscale_labels(pyramid, ...)`** (plural) takes a **pre-built
+  pyramid** (list of arrays, largest first) and only *writes* it — it never
+  downsamples. This is why the scripts carry `downsample_yx`: **it is required**
+  to produce levels 1..N for this function.
+- **`write_labels(labels, ...)`** (singular) takes a **single** array +
+  `scale_factors` + `method=Methods.NEAREST` and **builds the pyramid itself**.
+  With it (or the high-level `OMEZarrLabels`), `downsample_yx` is unnecessary.
+  Verified: one `(1,236,275,271)` array → full pyramid, y/x-only (z stays 236),
+  binary preserved.
+
+**Why the scripts keep `downsample_yx` + `write_multiscale_labels` anyway** — the
+lower-level writer costs the pyramid helper but buys three things the
+auto-builders don't give:
+
+1. **Out-of-core streaming.** `downsample_yx` uses lazy dask slicing
+   (`[..., ::2, ::2]`) and each level is `rechunk`-ed to shard boundaries, so
+   `da.to_zarr` streams. The auto-builders' internal scaler may materialise /
+   re-chunk differently, undermining the dask variant's whole point.
+2. **Exact scales.** `write_multiscale_labels` + hand-built `transforms` pin the
+   source's clean `×2` scales; `write_labels` / `OMEZarrLabels` derive them from
+   shape ratios (drift, `y≠x` — see the section above).
+3. **Precise level control.** In testing, `write_labels`' deprecated default
+   `scaler` (`max_layer=4`) **overrode** a 2-entry `scale_factors` and emitted
+   **5** levels — the kind of surprise avoided by building the pyramid ourselves.
+
+So `downsample_yx` is the deliberate price of a streaming, source-faithful
+writer. Drop it only if you switch to `write_labels` and accept auto-derived
+scales + less streaming control.
+
 ### Benchmark caveat: dask is *slower* on small data
 
 Measured on this 35 MB channel (peak RSS via `/usr/bin/time -v`):
