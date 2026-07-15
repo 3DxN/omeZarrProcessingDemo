@@ -100,8 +100,8 @@ still the whole channel.
 
 `threshold_label_dask.py` fixes this by staying lazy end-to-end:
 
-1. **Read lazily** — the ome-zarr-py Reader yields `node.data`, one dask array
-   per level; nothing is materialised.
+1. **Read lazily** — `OMEZarrMultiscale.from_ome_zarr(path)` yields one lazy
+   dask array per level (`.images[i].data`); nothing is materialised.
 2. **Streamed Otsu** — one pass for min/max, one for `da.histogram`; only the
    256-bin histogram lands in RAM. Identical maths to the numpy Otsu (factored
    into `otsu_from_histogram`), so the threshold is bit-for-bit the same.
@@ -113,23 +113,57 @@ still the whole channel.
 Cost: a global histogram is still one full read pass (unavoidable for Otsu),
 and Otsu needs a value range (uses the channel's min/max — one extra pass).
 
-### Reading: ome-zarr-py Reader vs. `zarr.open_group`
+### Reading: `OMEZarrMultiscale` vs. `Reader` vs. `zarr.open_group`
 
-`Reader(parse_url(path))` → `node.data` is a list of **lazy dask arrays** (one
-per level) plus parsed `node.metadata["axes"]` and
-`["coordinateTransformations"]`. Worth using in the dask script — it hands you
-exactly the lazy arrays + parsed metadata the pipeline consumes.
+ome-zarr-py 0.18 has a high-level object API (`from ome_zarr import
+OMEZarrMultiscale`) — the intended read interface (its docs use this very
+dataset). `threshold_label_dask.py` uses it:
+
+```python
+ms = OMEZarrMultiscale.from_ome_zarr(path)
+ms.images[i].data      # lazy dask array per pyramid level
+ms.metadata.axes       # pydantic Axis objects -> full dicts incl. units
+ms.images[i].scale     # {'c':1.0,'z':0.5002,'y':0.3604,'x':0.3604}
+ms.labels              # {'0': ..., 'threshold': ...} existing labels
+```
+
+It replaces the older low-level `parse_url` + `Reader` + `node.metadata[...]`
+path and is cleaner than hand-parsing `root.attrs["ome"]`.
 
 But it does **not** replace `zarr`:
-- It chunks the dask array at **inner-chunk** granularity `(1,1,256,256)`, not
-  the shard shape `(1,10,512,512)`. Mirroring the source chunk grid on write
-  still needs `zarr.open_array(...).shards`.
-- The reader is **read-only**; `write_multiscale_labels` needs a writable
+- It exposes only **inner-chunk** granularity `(1,1,256,256)`, not the shard
+  shape `(1,10,512,512)`. Mirroring the source chunk grid on write still needs
+  `zarr.open_array(...).shards`.
+- It is **read-oriented**; `write_multiscale_labels` needs a writable
   `zarr.Group` (`zarr.open_group(mode="a")`).
 
-So `threshold_label_dask.py` uses the Reader for the read side and keeps `zarr`
-for the write side + the shard lookup. For the eager scripts the Reader is not
+So the dask script reads via `OMEZarrMultiscale` and keeps `zarr` for the write
+side + the shard lookup. For the eager scripts the high-level reader is not
 worth it — they materialise anyway and still need `zarr` to write.
+
+### Why NOT the high-level `OMEZarrLabels` writer
+
+`OMEZarrLabels(img, method=NEAREST).to_ome_zarr(...)` looks ideal for labels
+(defaults to label-safe NEAREST, auto-builds the pyramid, auto-writes
+`image-label`). Tested against a store copy, it does emit v0.5 and mirrors
+chunks/shards via `storage_options` — but for *adding one label to an existing
+store* it has three verified gotchas, so the explicit `write_multiscale_labels`
+path is kept instead:
+
+1. **`store_exists` footgun.** Passing an existing `zarr.Group` sets
+   `store_exists=True` → `write_image_data=False`, so it silently writes **only**
+   `image-label` metadata and **no pixel data** — a broken empty label. You must
+   pass `overwrite=True` to actually write arrays.
+2. **No registration.** It does not add the label to `labels/`'s `ome.labels`
+   list, so viewers won't discover it — a manual append is still required.
+3. **Scales drift from the source.** It derives each level's scale from the
+   array **shape ratio** (e.g. `y=0.7234, x=0.72347` at level 1, and `y != x`)
+   instead of the source's clean `×2` (`0.7208`). `OMEZarrLabels` has no
+   `coordinateTransformations` argument, so the source's exact scales can't be
+   pinned. The explicit writer + hand-built transforms guarantee they match.
+
+(Its NEAREST pyramid does round shapes like the source — `275→137→68` — vs the
+scripts' `::2` `275→138→69`; both are valid nearest conventions.)
 
 ### Benchmark caveat: dask is *slower* on small data
 
