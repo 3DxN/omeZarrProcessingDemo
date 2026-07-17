@@ -2,10 +2,11 @@
 
 Repository to illustrate how to (lazy) load an OME-Zarr image (based on Zarr v3), compute a label image and store it within the original Zarr structure.
 
-Script [threshold_label_dask.py](threshold_label_dask.py) is based on dependency https://pypi.org/project/ome-zarr/
+Script [threshold_label.py](threshold_label.py) is based on low-level dependency https://pypi.org/project/zarr/ only. No lazy loading: Image data must fit into memory.
 
-Script [threshold_label_ngff.py](threshold_label_ngff.py) is based on dependency https://pypi.org/project/ngff-zarr/
+Script [threshold_label_dask.py](threshold_label_dask.py) is based on dependency https://pypi.org/project/ome-zarr/.
 
+Script [threshold_label_ngff.py](threshold_label_ngff.py) is based on dependency https://pypi.org/project/ngff-zarr/.
 No low level API from https://pypi.org/project/zarr/ is used.
 
 Implementation details can be found in [NOTES.md](NOTES.md).
