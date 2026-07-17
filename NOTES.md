@@ -269,17 +269,67 @@ editing the v3 `zarr.json` directly (pathlib + json, no `zarr` import):
 1. **No `image-label` metadata** — added to the label group's `zarr.json`.
 2. **No label registration** — the name is appended to `labels/`'s `ome.labels`.
 
-Layout differences from the other three scripts (both valid OME-Zarr, but worth
-knowing):
-
-- **Nested dataset paths** `scaleN/<name>` (e.g. `scale0/threshold`) instead of
-  the flat `0/1/2`. ngff-zarr's native convention.
-- Sub-level chunks are dim-clamped (`137`, `68`) like the dask script.
-
 Cross-checked: the result is a valid v0.5 label, **readable back by ome-zarr-py**
 (`OMEZarrMultiscale.from_ome_zarr`), with pixel data matching the reference
 threshold. Extra deps vs the dask script: `ngff-zarr`, `itkwasm`,
 `itkwasm-downsample`, `wasmtime`, `rich`.
+
+### Data layout: ome-zarr-py vs ngff-zarr on disk
+
+The two writers place the level arrays differently inside the label group. Both
+are valid OME-Zarr — a reader resolves levels through the `datasets[].path`
+strings in the `multiscales` metadata, not by directory convention — but the
+directory trees and those path strings differ.
+
+**ome-zarr-py** (`write_multiscale_labels`, used by `_omezarr.py` and
+`_dask.py`) — each level is an array **directly** under the label group, named
+`s0/s1/s2`:
+
+```
+labels/
+├── zarr.json                 # group: ome.labels = [ …, "threshold" ]   (registration)
+└── threshold/
+    ├── zarr.json             # group: ome.multiscales + image-label
+    │                         #        datasets[].path = "s0", "s1", "s2"
+    ├── s0/
+    │   ├── zarr.json         # ARRAY (1,236,275,271) int8, sharded
+    │   └── c/…               # shard/chunk data
+    ├── s1/  { zarr.json, c/… }   # ARRAY
+    └── s2/  { zarr.json, c/… }   # ARRAY
+```
+
+**ngff-zarr** (`to_ngff_zarr`) — each level lives in a `scaleN/` subdirectory
+that *wraps* an array named after the image, so arrays sit one level **deeper**
+and the dataset paths are nested `scaleN/<name>`:
+
+```
+labels/
+├── zarr.json                 # group: ome.labels = [ …, "threshold" ]   (patched in)
+└── threshold/
+    ├── zarr.json             # group: ome.multiscales + image-label (image-label patched in)
+    │                         #        datasets[].path = "scale0/threshold", "scale1/threshold", …
+    ├── scale0/
+    │   └── threshold/
+    │       ├── zarr.json     # ARRAY (1,236,275,271) int8, sharded
+    │       └── c/…           # shard/chunk data
+    ├── scale1/threshold/  { zarr.json, c/… }   # ARRAY
+    └── scale2/threshold/  { zarr.json, c/… }   # ARRAY
+```
+
+Differences that matter:
+
+- **Depth / paths.** ome-zarr-py: `datasets[].path = "s0"` (array one level down).
+  ngff-zarr: `datasets[].path = "scale0/threshold"` (array two levels down, inside
+  a per-scale `scaleN/` subdirectory). The hand-written `threshold_label.py` uses
+  flat `0/1/2`.
+- **Metadata provenance.** ome-zarr-py writes `multiscales` **and** `image-label`
+  and registers the label itself. ngff-zarr writes only `multiscales`; this
+  script **patches in** `image-label` and the `labels/` registration (marked
+  above) by editing `zarr.json`.
+- **Sub-level chunks** are dim-clamped (`137`, `68`) in both, like the dask script.
+- **Interop.** Despite the layout gap, each is readable by the other library —
+  verified `OMEZarrMultiscale.from_ome_zarr` reads the ngff-zarr output fine,
+  because both honor the `datasets[].path` indirection.
 
 ### Benchmark caveat: dask is *slower* on small data
 
