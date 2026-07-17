@@ -1,19 +1,21 @@
 # OME-Zarr binary-threshold labels — implementation notes
 
-Two scripts write a binary-threshold **label** image into the existing
+Four scripts write a binary-threshold **label** image into the existing
 OME-Zarr **v0.5** store `6001240_labels.zarr`:
 
 | Script | Approach | Memory model |
 |---|---|---|
 | `threshold_label.py` | Pyramid, metadata and chunking written **by hand** with `zarr` v3. | Eager — full channel in RAM. |
 | `threshold_label_omezarr.py` | Same Otsu + pyramid, but writing delegated to **`ome-zarr-py`** (`write_multiscale_labels`). | Eager — full channel in RAM. |
-| `threshold_label_dask.py` | Read via ome-zarr-py Reader, lazy **dask** end-to-end: streamed histogram Otsu + streamed `da.to_zarr` writes. | Out-of-core — a few chunks in RAM. |
+| `threshold_label_dask.py` | Read via `OMEZarrMultiscale`, lazy **dask** end-to-end: streamed histogram Otsu + streamed `da.to_zarr` writes; **no `zarr` import**. | Out-of-core — a few chunks in RAM. |
+| `threshold_label_ngff.py` | Same lazy pipeline built on **`ngff-zarr`** (`from_ngff_zarr` → `to_multiscales` → `to_ngff_zarr`); `image-label` + registration patched via json. | Out-of-core — a few chunks in RAM. |
 
-All three produce **byte-identical** label output (same v0.5 metadata, scales,
-`int8` data, chunks `(1,1,256,256)`, shards `(1,10,512,512)`). They differ only
-in *how* they read/write, not in *what* they write.
+The first three produce **byte-identical** label output (same v0.5 metadata,
+scales, `int8` data, chunks `(1,1,256,256)`, shards `(1,10,512,512)`). The
+ngff-zarr script writes the same pixels but with its own layout conventions
+(see its section below). They differ mainly in *how* they read/write.
 
-Both read the source image (path `0`, shape `[2, 236, 275, 271]`, `uint16`,
+All read the source image (path `0`, shape `[2, 236, 275, 271]`, `uint16`,
 axes `c,z,y,x`), threshold one channel (default `1` = Dapi), and write the
 result under `labels/<name>` with full `multiscales` + `image-label` metadata.
 
@@ -23,9 +25,10 @@ result under `labels/<name>` with full `multiscales` + `image-label` metadata.
   ```
   python -m venv .venv && source .venv/bin/activate
   pip install "zarr>=3" numpy            # hand-written script
-  pip install "ome-zarr==0.18.0"         # adds the ome-zarr-py variant (pulls dask, ome-zarr-models)
+  pip install "ome-zarr==0.18.0"         # adds the ome-zarr-py variants (pulls dask, ome-zarr-models)
+  pip install ngff-zarr                  # adds the ngff-zarr variant (pulls itkwasm, wasmtime, rich)
   ```
-- Verified with `zarr 3.2.1`, `numpy 2.5.1`, `ome-zarr 0.18.0`.
+- Verified with `zarr 3.2.1`, `numpy 2.5.1`, `ome-zarr 0.18.0`, `ngff-zarr 0.38.0`.
 
 ## Key insights / design decisions
 
@@ -233,6 +236,51 @@ So `downsample_yx` is the deliberate price of a streaming, source-faithful
 writer. Drop it only if you switch to `write_labels` and accept auto-derived
 scales + less streaming control.
 
+## The `ngff-zarr` variant (`threshold_label_ngff.py`)
+
+A second out-of-core implementation built on **`ngff-zarr`** (0.38) instead of
+ome-zarr-py. Same lazy pipeline shape; the whole read → pyramid → write path is
+ngff-zarr idiom:
+
+```python
+ms = nz.from_ngff_zarr(path)                 # lazy: images[i].data are dask
+label_img = nz.to_ngff_image(mask, dims=dims, scale=img.scale, axes_units=...)
+label_ms  = nz.to_multiscales(label_img, scale_factors=[{"z":1,"y":2,"x":2}, ...],
+                              method=nz.Methods.ITKWASM_LABEL_IMAGE, chunks=chunks)
+nz.to_ngff_zarr(f"{path}/labels/{name}", label_ms, version="0.5",
+                chunks_per_shard={"c":1,"z":4,"y":4,"x":4})
+```
+
+What it gets right out of the box (verified):
+
+- **Lazy end-to-end** — `from_ngff_zarr` yields dask arrays, `to_multiscales`
+  keeps them lazy, `to_ngff_zarr` streams shards. Out-of-core like the dask one.
+- **Label-safe downsampling** — `Methods.ITKWASM_LABEL_IMAGE` (label-aware,
+  y/x-only via dict `scale_factors`). `DASK_IMAGE_NEAREST` also exists but needs
+  an extra `dask_image` package; ITKWASM ships with ngff-zarr (`itkwasm-downsample`).
+- **Clean ×2 scales** — `to_multiscales` derives scales from the factors, not
+  shape ratios, so they match the source exactly (`0.3604 → 0.7208 → 1.4416`).
+  This is *better* than ome-zarr-py's `OMEZarrLabels`, which drifts (`y≠x`).
+- **Sharding** — via `chunks_per_shard` (per-axis dict); `--no-shard` disables it.
+
+What ngff-zarr does **not** do (it is image-focused), patched afterwards by
+editing the v3 `zarr.json` directly (pathlib + json, no `zarr` import):
+
+1. **No `image-label` metadata** — added to the label group's `zarr.json`.
+2. **No label registration** — the name is appended to `labels/`'s `ome.labels`.
+
+Layout differences from the other three scripts (both valid OME-Zarr, but worth
+knowing):
+
+- **Nested dataset paths** `scaleN/<name>` (e.g. `scale0/threshold`) instead of
+  the flat `0/1/2`. ngff-zarr's native convention.
+- Sub-level chunks are dim-clamped (`137`, `68`) like the dask script.
+
+Cross-checked: the result is a valid v0.5 label, **readable back by ome-zarr-py**
+(`OMEZarrMultiscale.from_ome_zarr`), with pixel data matching the reference
+threshold. Extra deps vs the dask script: `ngff-zarr`, `itkwasm`,
+`itkwasm-downsample`, `wasmtime`, `rich`.
+
 ### Benchmark caveat: dask is *slower* on small data
 
 Measured on this 35 MB channel (peak RSS via `/usr/bin/time -v`):
@@ -248,10 +296,11 @@ would exhaust memory. **Rule of thumb: use the eager script until the channel
 no longer fits in RAM, then switch to the dask script.**
 
 ### The Otsu threshold is intentionally hand-rolled
-`otsu_threshold()` is a small numpy implementation, kept in **both** scripts to
-avoid a scikit-image dependency. `skimage.filters.threshold_otsu` is a drop-in
-replacement if scikit-image is otherwise available. This was a deliberate
-decision — do not replace it without cause.
+`otsu_threshold()` is a small numpy implementation, kept across **all** scripts
+to avoid a scikit-image dependency (the lazy scripts feed the same maths a dask
+histogram via `otsu_from_histogram`). `skimage.filters.threshold_otsu` is a
+drop-in replacement if scikit-image is otherwise available. This was a
+deliberate decision — do not replace it without cause.
 
 ## Usage
 
@@ -273,4 +322,12 @@ the source; only the shard factor is user-chosen):
 python threshold_label_dask.py                        # shards = chunk x (c1 z4 y4 x4)
 python threshold_label_dask.py --shard-z 2 --shard-y 8 # custom per-axis factors
 python threshold_label_dask.py --no-shard             # unsharded (chunks only)
+```
+
+`threshold_label_ngff.py` (ngff-zarr) takes the same flags, including the
+`--shard-*` / `--no-shard` sharding controls:
+
+```
+python threshold_label_ngff.py                        # ngff-zarr, shards c1 z4 y4 x4
+python threshold_label_ngff.py --no-shard             # unsharded
 ```
