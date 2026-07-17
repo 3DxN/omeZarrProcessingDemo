@@ -381,3 +381,19 @@ python threshold_label_dask.py --no-shard             # unsharded (chunks only)
 python threshold_label_ngff.py                        # ngff-zarr, shards c1 z4 y4 x4
 python threshold_label_ngff.py --no-shard             # unsharded
 ```
+
+## Testing
+
+```
+bash tests/test_scripts.sh
+```
+
+Copies the store to a throwaway dir, runs **all four** scripts into it with a
+fixed threshold (deterministic), and verifies each output with
+`tests/verify_label.py` — the real store is never touched. Checks are
+layout-agnostic (levels resolved via the multiscales `datasets[].path`, so
+`0/1/2`, `s0/s1/s2` and `scaleN/<name>` all pass): v0.5 + `image-label`
+metadata, binary `int8` at every level, `labels/` registration, and level-0
+pixels `== (channel > threshold)`. Exits non-zero if any script fails. The
+level-0 pixel check is real, not vacuous — feeding `verify_label.py` a wrong
+threshold makes it fail.
